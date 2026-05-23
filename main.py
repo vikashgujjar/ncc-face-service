@@ -69,8 +69,11 @@ def get_embedding(bgr: np.ndarray, face_box) -> np.ndarray:
     return _recognizer.feature(_recognizer.alignCrop(bgr, face_box)).flatten()
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    return float(np.dot(a, b) / (na * nb)) if na and nb else 0.0
+    a, b = a.flatten(), b.flatten()
+    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class KnownFace(BaseModel):
@@ -103,7 +106,7 @@ async def encode_face(image: UploadFile = File(...)):
         bgr   = bytes_to_bgr(await image.read())
         faces = detect_faces(bgr)
 
-        if not faces:
+        if len(faces) == 0:
             raise HTTPException(422, "No face detected in the image")
         if len(faces) > 1:
             raise HTTPException(422, "Multiple faces detected. Use a single-person photo")
@@ -129,7 +132,7 @@ async def recognize_face(req: RecognizeRequest):
         bgr   = b64_to_bgr(req.image_base64)
         faces = detect_faces(bgr)
 
-        if not faces:
+        if len(faces) == 0:
             return {"success": False, "message": "No face detected in frame"}
 
         if not req.known_faces:

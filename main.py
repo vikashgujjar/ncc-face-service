@@ -27,8 +27,10 @@ RECOGNIZER_PATH = MODELS_DIR / "face_recognition_sface_2021dec.onnx"
 DETECTOR_URL   = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 RECOGNIZER_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
 
-CONFIDENCE_THRESHOLD = float(os.getenv("FACE_THRESHOLD", "0.50"))
-MIN_FACE_AREA_RATIO  = float(os.getenv("MIN_FACE_AREA", "0.04"))   # face must be ≥4% of frame area
+CONFIDENCE_THRESHOLD  = float(os.getenv("FACE_THRESHOLD",       "0.50"))
+MIN_FACE_AREA_RATIO   = float(os.getenv("MIN_FACE_AREA",         "0.04"))   # face must be ≥4% of frame area
+MIN_LIVENESS_MOTION   = float(os.getenv("MIN_LIVENESS_MOTION",   "1.5"))    # mean abs pixel diff threshold
+MIN_LIVENESS_FRAMES   = int(os.getenv(  "MIN_LIVENESS_FRAMES",   "3"))      # minimum frames required
 
 # ── Download models on startup ────────────────────────────────────────────────
 def download_model(url: str, dest: Path):
@@ -47,7 +49,7 @@ _detector   = cv2.FaceDetectorYN.create(str(DETECTOR_PATH),   "", (320, 320), sc
 _recognizer = cv2.FaceRecognizerSF.create(str(RECOGNIZER_PATH), "")
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="NCC Face Recognition Service", version="3.0.0")
+app = FastAPI(title="NCC Face Recognition Service", version="3.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -76,21 +78,55 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
         return 0.0
     return float(np.dot(a, b) / (na * nb))
 
+def check_liveness_frames(frames_b64: list) -> tuple:
+    """
+    Compare consecutive frames for pixel-level motion.
+    A static photo/screen has near-zero frame difference; a live face has visible motion
+    from breathing, micro-movements, and eye activity.
+    Returns (is_live: bool, message: str).
+    """
+    if not frames_b64:
+        return False, "Liveness frames missing. Please complete the face scan from the attendance page."
+
+    if len(frames_b64) < MIN_LIVENESS_FRAMES:
+        return False, f"Insufficient liveness data ({len(frames_b64)} frames). Please repeat the face scan."
+
+    arrays = []
+    for b64 in frames_b64[:8]:
+        try:
+            small = cv2.resize(b64_to_bgr(b64), (80, 60))
+            arrays.append(small.astype(np.float32).flatten())
+        except Exception:
+            pass
+
+    if len(arrays) < 2:
+        return False, "Could not process liveness frames. Please try again."
+
+    diffs = [float(np.mean(np.abs(arrays[i + 1] - arrays[i]))) for i in range(len(arrays) - 1)]
+    avg_motion = float(np.mean(diffs))
+    logger.info(f"Liveness motion score: {avg_motion:.3f} (threshold: {MIN_LIVENESS_MOTION})")
+
+    if avg_motion < MIN_LIVENESS_MOTION:
+        return False, "Anti-spoofing check failed — static image detected. Please use a live camera."
+
+    return True, "ok"
+
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class KnownFace(BaseModel):
     student_id: int
     encoding:   List[float]
 
 class RecognizeRequest(BaseModel):
-    image_base64: str
-    known_faces:  List[KnownFace]   # Laravel passes encodings — no DB needed
-    latitude:     Optional[float] = None
-    longitude:    Optional[float] = None
+    image_base64:    str
+    known_faces:     List[KnownFace]        # Laravel passes encodings — no DB needed
+    liveness_frames: List[str]   = []       # JPEG frames from client liveness check
+    latitude:        Optional[float] = None
+    longitude:       Optional[float] = None
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "NCC Face Recognition", "version": "3.0.0"}
+    return {"status": "ok", "service": "NCC Face Recognition", "version": "3.1.0"}
 
 @app.get("/health")
 def health():
@@ -131,6 +167,11 @@ async def recognize_face(req: RecognizeRequest):
     Security: rejects multiple faces, tiny faces (photo-of-photo), low confidence.
     """
     try:
+        # Server-side liveness: verify frame-to-frame motion to reject static photos/screens
+        is_live, lv_msg = check_liveness_frames(req.liveness_frames)
+        if not is_live:
+            return {"success": False, "message": lv_msg}
+
         bgr   = b64_to_bgr(req.image_base64)
         h, w  = bgr.shape[:2]
         faces = detect_faces(bgr)

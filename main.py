@@ -27,7 +27,8 @@ RECOGNIZER_PATH = MODELS_DIR / "face_recognition_sface_2021dec.onnx"
 DETECTOR_URL   = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 RECOGNIZER_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
 
-CONFIDENCE_THRESHOLD = float(os.getenv("FACE_THRESHOLD", "0.40"))
+CONFIDENCE_THRESHOLD = float(os.getenv("FACE_THRESHOLD", "0.50"))
+MIN_FACE_AREA_RATIO  = float(os.getenv("MIN_FACE_AREA", "0.04"))   # face must be ≥4% of frame area
 
 # ── Download models on startup ────────────────────────────────────────────────
 def download_model(url: str, dest: Path):
@@ -127,25 +128,41 @@ async def recognize_face(req: RecognizeRequest):
     """
     Match frame against known_faces supplied by Laravel.
     Laravel fetches encodings from DB and sends them here — no DB access needed.
+    Security: rejects multiple faces, tiny faces (photo-of-photo), low confidence.
     """
     try:
         bgr   = b64_to_bgr(req.image_base64)
+        h, w  = bgr.shape[:2]
         faces = detect_faces(bgr)
 
         if len(faces) == 0:
-            return {"success": False, "message": "No face detected in frame"}
+            return {"success": False, "message": "No face detected. Please look directly at the camera."}
+
+        if len(faces) > 1:
+            return {"success": False, "message": "Multiple faces detected. Only one person should be in frame."}
+
+        # Reject tiny faces — likely a photo of a photo held up to the camera
+        face      = faces[0]
+        face_area = float(face[2]) * float(face[3])   # width × height from YuNet box
+        img_area  = float(w) * float(h)
+        if img_area > 0 and (face_area / img_area) < MIN_FACE_AREA_RATIO:
+            return {"success": False, "message": "Face too small or too far from camera. Please move closer."}
 
         if not req.known_faces:
             return {"success": False, "message": "No registered faces in system"}
 
-        query_emb    = get_embedding(bgr, faces[0])
+        query_emb    = get_embedding(bgr, face)
         known_embs   = [np.array(kf.encoding, dtype=np.float32) for kf in req.known_faces]
         similarities = [cosine_similarity(query_emb, k) for k in known_embs]
         best_idx     = int(np.argmax(similarities))
         best_sim     = similarities[best_idx]
 
         if best_sim < CONFIDENCE_THRESHOLD:
-            return {"success": False, "message": "Face not recognized", "confidence": round(best_sim, 3)}
+            return {
+                "success":    False,
+                "message":    f"Face not recognized (confidence {round(best_sim*100)}%). Please try again in better lighting.",
+                "confidence": round(best_sim, 3),
+            }
 
         return {
             "success":    True,
